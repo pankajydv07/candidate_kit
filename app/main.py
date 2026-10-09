@@ -12,12 +12,11 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Union
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Path, Query, status
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator, model_validator
+from fastapi import FastAPI, HTTPException, Path, Query
+from pydantic import BaseModel, Field, model_validator
 import pymongo
 from pymongo import MongoClient, ASCENDING, DESCENDING
-from pymongo.errors import DuplicateKeyError, PyMongoError
+from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
@@ -62,13 +61,6 @@ def dt_to_epoch_ms(dt: Optional[datetime]) -> Optional[int]:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000)
-
-
-def dt_to_ist(dt: datetime) -> datetime:
-    """Convert datetime to IST timezone."""
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(IST)
 
 
 def is_overnight_shift(shift_start: str, shift_end: str) -> bool:
@@ -131,11 +123,6 @@ def compute_overtime(punch_out_ms: int, shift_start: str, shift_end: str, attend
     if elapsed_seconds >= 1800:
         return int(elapsed_seconds // 60)
     return 0
-
-
-def compute_half_day(work_hours: Optional[float]) -> bool:
-    """R5: Half day is true when the rounded work_hours < 4.50."""
-    return bool(work_hours is not None and work_hours < 4.50)
 
 
 def format_history_entries(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -357,7 +344,7 @@ def punch_out(body: PunchOutRequest):
 
     work_hours = compute_work_hours(punch_in_ms, punch_out_ms)
     overtime_minutes = compute_overtime(punch_out_ms, emp["shift_start"], emp["shift_end"], rec["date"])
-    half_day = compute_half_day(work_hours)
+    half_day = bool(work_hours is not None and work_hours < 4.50)
 
     updated_rec = db.attendance_logs.find_one_and_update(
         {"_id": rec["_id"], "punch_out": None},
@@ -471,30 +458,24 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
         if new_punch_out_ms is not None:
             new_work_hours = compute_work_hours(new_punch_in_ms, new_punch_out_ms)
             new_overtime_minutes = compute_overtime(new_punch_out_ms, emp["shift_start"], emp["shift_end"], date)
-            new_half_day = compute_half_day(new_work_hours)
+            new_half_day = bool(new_work_hours is not None and new_work_hours < 4.50)
         else:
             new_work_hours = None
             new_overtime_minutes = 0
             new_half_day = False
 
-    changes_api: Dict[str, Any] = {}
-    changes_db: Dict[str, Any] = {}
+    fields = [
+        ("status", old_status, new_status, old_status, new_status),
+        ("punch_in", old_punch_in_ms, new_punch_in_ms, ms_to_utc_dt(old_punch_in_ms), ms_to_utc_dt(new_punch_in_ms)),
+        ("punch_out", old_punch_out_ms, new_punch_out_ms, ms_to_utc_dt(old_punch_out_ms), ms_to_utc_dt(new_punch_out_ms)),
+        ("work_hours", old_work_hours, new_work_hours, old_work_hours, new_work_hours),
+        ("late_minutes", old_late_minutes, new_late_minutes, old_late_minutes, new_late_minutes),
+        ("overtime_minutes", old_overtime_minutes, new_overtime_minutes, old_overtime_minutes, new_overtime_minutes),
+        ("half_day", old_half_day, new_half_day, old_half_day, new_half_day),
+    ]
 
-    def track_change(field_name: str, old_val: Any, new_val: Any, old_db: Any = None, new_db: Any = None):
-        if old_val != new_val:
-            changes_api[field_name] = {"from": old_val, "to": new_val}
-            changes_db[field_name] = {
-                "from": old_db if old_db is not None else old_val,
-                "to": new_db if new_db is not None else new_val,
-            }
-
-    track_change("status", old_status, new_status)
-    track_change("punch_in", old_punch_in_ms, new_punch_in_ms, ms_to_utc_dt(old_punch_in_ms), ms_to_utc_dt(new_punch_in_ms))
-    track_change("punch_out", old_punch_out_ms, new_punch_out_ms, ms_to_utc_dt(old_punch_out_ms), ms_to_utc_dt(new_punch_out_ms))
-    track_change("work_hours", old_work_hours, new_work_hours)
-    track_change("late_minutes", old_late_minutes, new_late_minutes)
-    track_change("overtime_minutes", old_overtime_minutes, new_overtime_minutes)
-    track_change("half_day", old_half_day, new_half_day)
+    changes_api = {f: {"from": old_a, "to": new_a} for f, old_a, new_a, _, _ in fields if old_a != new_a}
+    changes_db = {f: {"from": old_d, "to": new_d} for f, old_a, new_a, old_d, new_d in fields if old_a != new_a}
 
     if not changes_api:
         raise HTTPException(status_code=422, detail="Request changes nothing")
@@ -590,11 +571,8 @@ def get_employee_monthly(emp_code: str, month: str = Query(..., pattern=r"^\d{4}
     working_days = 0
     if start_date_str <= month_end:
         cur = date.fromisoformat(start_date_str)
-        end_d = date.fromisoformat(month_end)
-        while cur <= end_d:
-            if cur.weekday() < 5:
-                working_days += 1
-            cur += timedelta(days=1)
+        total_d = (date.fromisoformat(month_end) - cur).days + 1
+        working_days = sum(1 for i in range(total_d) if (cur + timedelta(days=i)).weekday() < 5)
 
     pipeline = build_employee_monthly_pipeline(emp_code, month_start, month_end)
     results = list(db.attendance_logs.aggregate(pipeline))
@@ -984,21 +962,13 @@ def explain_endpoint(
         if status:
             q["status"] = status
         skip = (page - 1) * page_size
-        plan = (
-            db.attendance_logs.find(q)
-            .sort([("date", DESCENDING), ("emp_code", ASCENDING)])
-            .skip(skip)
-            .limit(page_size)
-            .explain()["executionStats"]
-            if hasattr(db.attendance_logs.find(), "explain")
-            else db.command("explain", {
-                "find": "attendance_logs",
-                "filter": q,
-                "sort": {"date": -1, "emp_code": 1},
-                "skip": skip,
-                "limit": page_size,
-            }, verbosity="executionStats")
-        )
+        plan = db.command("explain", {
+            "find": "attendance_logs",
+            "filter": q,
+            "sort": {"date": -1, "emp_code": 1},
+            "skip": skip,
+            "limit": page_size,
+        }, verbosity="executionStats")
         return {"endpoint": endpoint, "collection": "attendance_logs", "explain": plan}
 
     elif endpoint == "employee_monthly":
