@@ -1,4 +1,4 @@
-# DECISIONS.md (about 150-200 words in total - plain language, your own words)
+# DECISIONS.md 
 
 1. **Indexes.**
 We created unique indexes on `employees.emp_code` and `attendance_logs(emp_code, date)` to eliminate duplicate registrations and punch-in race conditions at the database level. For queries and sorting, we indexed `attendance_logs(date, status)` and `attendance_logs(emp_code, date)`. We considered individual indexes on every filter field, but rejected that to prevent write amplification.
